@@ -37,6 +37,10 @@ const DEFAULT_PADDING_SCHEME =
     "5=500-1000\n" ++
     "6=500-1000\n" ++
     "7=500-1000";
+const CONNECTION_WORKER_COUNT = 32;
+const RELAY_WORKER_COUNT = 32;
+const CONNECTION_THREAD_STACK_SIZE = 256 * 1024;
+const RELAY_THREAD_STACK_SIZE = 128 * 1024;
 
 var insecure_sni_disabled = std.atomic.Value(bool).init(false);
 
@@ -150,6 +154,10 @@ const TlsConn = struct {
         if (self.ca_bundle) |*bundle| bundle.deinit(allocator);
         self.stream.close();
         allocator.destroy(self);
+    }
+
+    fn shutdown(self: *TlsConn) void {
+        posix.shutdown(self.stream.handle, .both) catch {};
     }
 };
 
@@ -487,7 +495,7 @@ fn readSocksTarget(allocator: Allocator, stream: std.net.Stream) !SocksTarget {
     return .{ .atyp = atyp, .addr = addr, .port = std.mem.readInt(u16, &port_buf, .big) };
 }
 
-fn handleSocks(allocator: Allocator, client: std.net.Stream, cfg: Config) !void {
+fn handleSocks(allocator: Allocator, client: std.net.Stream, cfg: Config, relay_pool: *std.Thread.Pool) !void {
     defer client.close();
     var methods_head: [2]u8 = undefined;
     try recvAllFd(client.handle, &methods_head);
@@ -516,7 +524,8 @@ fn handleSocks(allocator: Allocator, client: std.net.Stream, cfg: Config) !void 
 
     try sendAllFd(client.handle, &.{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 });
 
-    const client_thread = try std.Thread.spawn(.{}, relayClientToRemote, .{ allocator, client.handle, remote });
+    var relay_wait_group: std.Thread.WaitGroup = .{};
+    relay_pool.spawnWg(&relay_wait_group, relayClientToRemote, .{ allocator, client.handle, remote });
 
     remote_loop: while (true) {
         const frame = readFrame(allocator, remote) catch |err| switch (err) {
@@ -553,10 +562,12 @@ fn handleSocks(allocator: Allocator, client: std.net.Stream, cfg: Config) !void 
     }
 
     posix.shutdown(client.handle, .both) catch {};
-    client_thread.join();
+    remote.shutdown();
+    relay_wait_group.wait();
 }
 
 fn relayClientToRemote(allocator: Allocator, fd: posix.fd_t, remote: *TlsConn) void {
+    defer remote.shutdown();
     var buf: [8192]u8 = undefined;
     while (true) {
         const n = posix.recv(fd, &buf, 0) catch break;
@@ -569,16 +580,14 @@ fn relayClientToRemote(allocator: Allocator, fd: posix.fd_t, remote: *TlsConn) v
     writeFrame(remote, CMD_FIN, 1, "") catch {};
 }
 
-fn handleSocksThread(allocator: Allocator, client: std.net.Stream, cfg: Config) void {
-    handleSocks(allocator, client, cfg) catch |err| {
+fn handleSocksThread(allocator: Allocator, client: std.net.Stream, cfg: Config, relay_pool: *std.Thread.Pool) void {
+    handleSocks(allocator, client, cfg, relay_pool) catch |err| {
         std.log.err("connection failed: {}", .{err});
     };
 }
 
 pub fn main() !void {
-    var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_instance.deinit();
-    const allocator = gpa_instance.allocator();
+    const allocator = std.heap.c_allocator;
     const cfg = try parseArgs(allocator);
 
     const listen_addr = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
@@ -586,13 +595,28 @@ pub fn main() !void {
     defer server.deinit();
     std.log.info("{s} listening {s}:{} => {s}:{} sni={s} insecure={}", .{ client_name, cfg.listen_host, cfg.listen_port, cfg.server_host, cfg.server_port, cfg.sni, cfg.insecure });
 
+    var connection_pool: std.Thread.Pool = undefined;
+    try connection_pool.init(.{
+        .allocator = allocator,
+        .n_jobs = CONNECTION_WORKER_COUNT,
+        .stack_size = CONNECTION_THREAD_STACK_SIZE,
+    });
+    defer connection_pool.deinit();
+
+    var relay_pool: std.Thread.Pool = undefined;
+    try relay_pool.init(.{
+        .allocator = allocator,
+        .n_jobs = RELAY_WORKER_COUNT,
+        .stack_size = RELAY_THREAD_STACK_SIZE,
+    });
+    defer relay_pool.deinit();
+
     while (true) {
         const conn = try server.accept();
-        const thread = std.Thread.spawn(.{}, handleSocksThread, .{ allocator, conn.stream, cfg }) catch |err| {
-            std.log.err("spawn connection thread failed: {}", .{err});
+        connection_pool.spawn(handleSocksThread, .{ allocator, conn.stream, cfg, &relay_pool }) catch |err| {
+            std.log.err("queue connection failed: {}", .{err});
             conn.stream.close();
             continue;
         };
-        thread.detach();
     }
 }
