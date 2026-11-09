@@ -22,3 +22,25 @@
 anytls-zig --server-uri-file /tmp/anytls.uri -l 127.0.0.1:18081
 curl -x socks5h://127.0.0.1:18081 http://www.google.com/generate_204
 ```
+
+SOCKS negotiation has a shared 10-second deadline once a connection worker
+starts processing it. Incomplete greetings and CONNECT requests are closed
+even if the client periodically sends another byte. This deadline does not
+apply to established relays, DNS resolution, or the upstream TCP/TLS handshake.
+The existing 32-worker connection limit is unchanged.
+
+## Regression tests
+
+Build with Zig 0.15.2, then run the loopback-only Python 3 tests. OpenSSL is
+used to generate a temporary certificate for the local TLS echo peer. The
+relay test requires a Python SSL module with TLS 1.3 support; otherwise that
+test is reported as skipped.
+
+```sh
+zig build -Doptimize=ReleaseSafe
+python3 -m unittest discover -s tests -v
+```
+
+Set `ANYTLS_BIN` to test another native executable. No subscription, real
+credentials, or external network is required. The relay test uses a local
+TLS peer, while incomplete-handshake tests use an unused loopback upstream port.

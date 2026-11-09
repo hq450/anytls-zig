@@ -1,0 +1,33 @@
+name: SOCKS handshake regression
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Zig 0.15.2
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
+            -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+      - name: Check formatting
+        run: zig fmt --check src/main.zig
+      - name: Build native client
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Run loopback regression tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Cross-compile router client
+        run: zig build -Dtarget=aarch64-linux-musl -Dcpu=generic -Doptimize=ReleaseSmall --prefix zig-out-aarch64

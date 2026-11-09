@@ -41,6 +41,7 @@ const CONNECTION_WORKER_COUNT = 32;
 const RELAY_WORKER_COUNT = 32;
 const CONNECTION_THREAD_STACK_SIZE = 256 * 1024;
 const RELAY_THREAD_STACK_SIZE = 128 * 1024;
+const SOCKS_HANDSHAKE_TIMEOUT_NS = 10 * std.time.ns_per_s;
 
 var insecure_sni_disabled = std.atomic.Value(bool).init(false);
 
@@ -454,14 +455,47 @@ fn serializeSocksAddr(allocator: Allocator, atyp: u8, addr: []const u8, port: u1
     return try out.toOwnedSlice(allocator);
 }
 
-fn recvAllFd(fd: posix.fd_t, buf: []u8) !void {
-    var offset: usize = 0;
-    while (offset < buf.len) {
-        const n = try posix.recv(fd, buf[offset..], 0);
-        if (n == 0) return error.EndOfStream;
-        offset += n;
+const SocksHandshake = struct {
+    fd: posix.fd_t,
+    timer: std.time.Timer,
+
+    fn wait(self: *SocksHandshake, events: i16) !void {
+        while (true) {
+            const elapsed = self.timer.read();
+            if (elapsed >= SOCKS_HANDSHAKE_TIMEOUT_NS) return error.SocksHandshakeTimeout;
+            const remaining = SOCKS_HANDSHAKE_TIMEOUT_NS - elapsed;
+            const timeout_ms: i32 = @intCast((remaining + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+            var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = events, .revents = 0 }};
+            if (try posix.poll(&fds, timeout_ms) != 0) return;
+        }
     }
-}
+
+    fn readAll(self: *SocksHandshake, buf: []u8) !void {
+        var offset: usize = 0;
+        while (offset < buf.len) {
+            try self.wait(posix.POLL.IN);
+            const n = posix.recv(self.fd, buf[offset..], posix.MSG.DONTWAIT) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) return error.EndOfStream;
+            offset += n;
+        }
+    }
+
+    fn writeAll(self: *SocksHandshake, data: []const u8) !void {
+        var offset: usize = 0;
+        while (offset < data.len) {
+            try self.wait(posix.POLL.OUT);
+            const n = posix.send(self.fd, data[offset..], posix.MSG.DONTWAIT) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) return error.EndOfStream;
+            offset += n;
+        }
+    }
+};
 
 fn sendAllFd(fd: posix.fd_t, data: []const u8) !void {
     var offset: usize = 0;
@@ -472,16 +506,16 @@ fn sendAllFd(fd: posix.fd_t, data: []const u8) !void {
     }
 }
 
-fn readSocksTarget(allocator: Allocator, stream: std.net.Stream) !SocksTarget {
+fn readSocksTarget(allocator: Allocator, handshake: *SocksHandshake) !SocksTarget {
     var head: [4]u8 = undefined;
-    try recvAllFd(stream.handle, &head);
+    try handshake.readAll(&head);
     if (head[0] != 5 or head[1] != 1) return error.InvalidSocksRequest;
     const atyp = head[3];
     const addr_len: usize = switch (atyp) {
         1 => 4,
         3 => blk: {
             var one: [1]u8 = undefined;
-            try recvAllFd(stream.handle, &one);
+            try handshake.readAll(&one);
             break :blk one[0];
         },
         4 => 16,
@@ -489,23 +523,25 @@ fn readSocksTarget(allocator: Allocator, stream: std.net.Stream) !SocksTarget {
     };
     const addr = try allocator.alloc(u8, addr_len);
     errdefer allocator.free(addr);
-    try recvAllFd(stream.handle, addr);
+    try handshake.readAll(addr);
     var port_buf: [2]u8 = undefined;
-    try recvAllFd(stream.handle, &port_buf);
+    try handshake.readAll(&port_buf);
     return .{ .atyp = atyp, .addr = addr, .port = std.mem.readInt(u16, &port_buf, .big) };
 }
 
 fn handleSocks(allocator: Allocator, client: std.net.Stream, cfg: Config, relay_pool: *std.Thread.Pool) !void {
     defer client.close();
+    // One deadline covers all SOCKS reads; partial progress must not pin a worker forever.
+    var handshake = SocksHandshake{ .fd = client.handle, .timer = try std.time.Timer.start() };
     var methods_head: [2]u8 = undefined;
-    try recvAllFd(client.handle, &methods_head);
+    try handshake.readAll(&methods_head);
     if (methods_head[0] != 5) return error.InvalidSocksHandshake;
     var methods_buf: [255]u8 = undefined;
     const method_count = methods_head[1];
-    try recvAllFd(client.handle, methods_buf[0..method_count]);
-    try sendAllFd(client.handle, &.{ 5, 0 });
+    try handshake.readAll(methods_buf[0..method_count]);
+    try handshake.writeAll(&.{ 5, 0 });
 
-    const target = try readSocksTarget(allocator, client);
+    const target = try readSocksTarget(allocator, &handshake);
     defer allocator.free(target.addr);
     if (target.atyp == 3) {
         std.log.info("proxy target {s}:{}", .{ target.addr, target.port });
